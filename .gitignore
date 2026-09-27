@@ -1,0 +1,33 @@
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*.session*
+
+# Python and packaging
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Application runtime data
+logs/
+downloads/
+*.log
+
+# Editors and operating-system files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

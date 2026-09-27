@@ -1,0 +1,14 @@
+services:
+  telegram-bot:
+    image: restricted-content-downloader:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.12"
+    env_file:
+      - .env
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./logs:/app/logs

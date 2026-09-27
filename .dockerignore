@@ -1,0 +1,16 @@
+.env
+.venv
+.git
+.gitignore
+__pycache__
+.pytest_cache
+.ruff_cache
+*.egg-info
+tests
+logs
+downloads
+data
+mirror
+*.session
+*.session-journal
+*.py[cod]
