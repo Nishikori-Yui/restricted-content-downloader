@@ -2,7 +2,7 @@
 
 Restricted Content Downloader is a private Telegram bot that copies posts from channels and chats its owner account can access. Send a post link to the bot, or use `/bdl` to copy a range of post IDs.
 
-The bot uses two Telegram clients: an owner user account reads the source post, and the bot account sends the copied content to the requesting chat. ** The owner account must already be able to open the source chat. **
+The bot uses two Telegram clients: an owner user account reads the source post, and the bot account sends the copied content to the requesting chat.  **_The owner account must already be able to open the source chat._**
 
 ## Features
 
