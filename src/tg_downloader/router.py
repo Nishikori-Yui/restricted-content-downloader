@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import shutil
+import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 
 import psutil
@@ -35,6 +39,8 @@ HELP_TEXT = (
     "`/killall` — cancel all active transfers.\n"
     "`/stats` — show bot and host resource usage.\n"
     "`/logs` — send the current log file.\n\n"
+    "`/cleanup` — preview persistent media cache cleanup.\n"
+    "`/cleanup confirm` — confirm the cleanup preview within 60 seconds.\n\n"
     "You can also send a post URL directly. The source account must be able to open it."
 )
 
@@ -46,6 +52,7 @@ class BotRouter:
         self.allowed_user_ids = allowed_user_ids
         self.max_batch = max_batch
         self._jobs: dict[int, set[asyncio.Task]] = {}
+        self._cleanup_confirmations = {}
         self._started_at = time.monotonic()
 
     def install(self):
@@ -55,7 +62,9 @@ class BotRouter:
         if not event.is_private:
             return
         if event.sender_id not in self.allowed_user_ids:
-            await event.reply("This bot is private and is not enabled for your account.")
+            await event.reply(
+                "This bot is private and is not enabled for your account."
+            )
             return
 
         text = (event.raw_text or "").strip()
@@ -65,7 +74,9 @@ class BotRouter:
         if command == "/start":
             await event.reply(START_TEXT, link_preview=False)
         elif command == "/help":
-            await event.reply(HELP_TEXT.format(max_batch=self.max_batch), link_preview=False)
+            await event.reply(
+                HELP_TEXT.format(max_batch=self.max_batch), link_preview=False
+            )
         elif command == "/status":
             jobs = self._jobs.get(event.chat_id, set())
             active = sum(not job.done() for job in jobs)
@@ -88,12 +99,12 @@ class BotRouter:
             if not log_path.is_file():
                 await event.reply("No log file is available yet.")
             else:
-                await self.bot.send_file(
-                    event.chat_id,
-                    str(log_path),
-                    caption="Bot logs",
-                    reply_to=event.id,
-                )
+                await self._send_redacted_logs(event, log_path)
+        elif command == "/cleanup":
+            if argument_text.strip().lower() == "confirm":
+                await self._confirm_cleanup(event)
+            else:
+                await self._preview_cleanup(event)
         elif command == "/dl":
             await self._start_single(event, argument_text)
         elif command == "/bdl":
@@ -106,7 +117,9 @@ class BotRouter:
             if url:
                 self._schedule(event, self._copy_one(event, url))
             elif text:
-                await event.reply("Send a Telegram post URL, or use `/help` for instructions.")
+                await event.reply(
+                    "Send a Telegram post URL, or use `/help` for instructions."
+                )
 
     async def _start_single(self, event, argument_text):
         url = find_post_link(argument_text)
@@ -155,7 +168,9 @@ class BotRouter:
             await event.reply("Both URLs must refer to the same channel or chat.")
             return
         if first.message_id > last.message_id:
-            await event.reply("The first post ID must be less than or equal to the last post ID.")
+            await event.reply(
+                "The first post ID must be less than or equal to the last post ID."
+            )
             return
         count = last.message_id - first.message_id + 1
         if count > self.max_batch:
@@ -188,16 +203,21 @@ class BotRouter:
         try:
             link = parse_post_link(url) if isinstance(url, str) else url
             peer, source = await self.copier.fetch(link)
-            copied = await self.copier.copy(
+            await status.edit(
+                f"Found {link.peer} / ID {link.message_id} · Preparing transfer…"
+            )
+            result = await self.copier.copy(
                 source,
                 peer,
                 event.chat_id,
                 event.id,
                 progress=self._progress_reporter(status),
             )
+            files = f" · {result.files} file(s)" if result.files else ""
+            cache = " · used cache" if result.cache_hit else ""
             await status.edit(
                 f"Completed: {link.peer} ID {link.message_id}; "
-                f"copied {copied} post(s)."
+                f"copied {result.posts} post(s){files}{cache}."
             )
         except asyncio.CancelledError:
             await status.edit("Transfer cancelled.")
@@ -231,7 +251,10 @@ class BotRouter:
         processed = 0
         failed_ids = []
         skipped_ids = []
+        failed_reasons = Counter()
+        skipped_reasons = Counter()
         seen_albums = set()
+        current_id = None
 
         async def create_progress_message(message_id):
             ordinal = message_id - first.message_id + 1
@@ -252,16 +275,21 @@ class BotRouter:
                 LOGGER.debug("Could not delete batch progress message", exc_info=True)
 
         async def process_post(message_id, peer, source, *, fetch_failed=False):
-            nonlocal completed, skipped, failed, processed
+            nonlocal completed, skipped, failed, processed, current_id
             processed += 1
+            current_id = message_id
             if not fetch_failed and (source is None or getattr(source, "empty", False)):
                 skipped += 1
                 skipped_ids.append(message_id)
+                skipped_reasons["unavailable or deleted"] += 1
+                current_id = None
                 return
             album_id = getattr(source, "grouped_id", None) if source else None
             if album_id is not None and album_id in seen_albums:
                 skipped += 1
                 skipped_ids.append(message_id)
+                skipped_reasons["part of an already copied album"] += 1
+                current_id = None
                 return
             if album_id is not None:
                 seen_albums.add(album_id)
@@ -271,8 +299,9 @@ class BotRouter:
                 if fetch_failed:
                     failed += 1
                     failed_ids.append(message_id)
+                    failed_reasons["could not fetch message"] += 1
                     return
-                completed += await self.copier.copy(
+                result = await self.copier.copy(
                     source,
                     peer,
                     event.chat_id,
@@ -284,17 +313,24 @@ class BotRouter:
                     if progress_message
                     else None,
                 )
+                completed += result.posts
             except asyncio.CancelledError:
+                current_id = message_id
                 raise
-            except Exception:
+            except Exception as exc:
                 failed += 1
                 failed_ids.append(message_id)
+                failed_reasons[self._failure_reason(exc)] += 1
                 LOGGER.exception("Could not copy batch item %s", message_id)
             finally:
                 await delete_progress_message(progress_message)
+                if current_id == message_id and not asyncio.current_task().cancelling():
+                    current_id = None
 
         try:
-            for chunk_start in range(first.message_id, last.message_id + 1, BATCH_FETCH_SIZE):
+            for chunk_start in range(
+                first.message_id, last.message_id + 1, BATCH_FETCH_SIZE
+            ):
                 chunk_end = min(chunk_start + BATCH_FETCH_SIZE, last.message_id + 1)
                 message_ids = list(range(chunk_start, chunk_end))
                 try:
@@ -313,7 +349,9 @@ class BotRouter:
                         except asyncio.CancelledError:
                             raise
                         except Exception:
-                            LOGGER.exception("Could not fetch batch item %s", message_id)
+                            LOGGER.exception(
+                                "Could not fetch batch item %s", message_id
+                            )
                             await process_post(
                                 message_id,
                                 None,
@@ -324,7 +362,9 @@ class BotRouter:
                         await process_post(message_id, peer, source)
                 else:
                     for message_id in message_ids:
-                        await process_post(message_id, peer, source_by_id.get(message_id))
+                        await process_post(
+                            message_id, peer, source_by_id.get(message_id)
+                        )
         except asyncio.CancelledError:
             await event.reply(
                 self._batch_status_text(
@@ -333,10 +373,12 @@ class BotRouter:
                     last,
                     total=total,
                     processed=processed,
-                    current_id=None,
+                    current_id=current_id,
                     completed=completed,
                     failed_ids=failed_ids,
                     skipped_ids=skipped_ids,
+                    failed_reasons=failed_reasons,
+                    skipped_reasons=skipped_reasons,
                 )
             )
             raise
@@ -349,10 +391,12 @@ class BotRouter:
                     last,
                     total=total,
                     processed=processed,
-                    current_id=None,
+                    current_id=current_id,
                     completed=completed,
                     failed_ids=failed_ids,
                     skipped_ids=skipped_ids,
+                    failed_reasons=failed_reasons,
+                    skipped_reasons=skipped_reasons,
                 )
             )
             return
@@ -367,6 +411,8 @@ class BotRouter:
                 completed=completed,
                 failed_ids=failed_ids,
                 skipped_ids=skipped_ids,
+                failed_reasons=failed_reasons,
+                skipped_reasons=skipped_reasons,
             )
         )
 
@@ -398,7 +444,8 @@ class BotRouter:
                 f"({BotRouter._readable_bytes(current)} / {BotRouter._readable_bytes(total)})"
             )
             try:
-                await status.edit(text)
+                if status is not None:
+                    await status.edit(text)
             except Exception:
                 LOGGER.debug("Could not refresh transfer progress", exc_info=True)
 
@@ -417,6 +464,8 @@ class BotRouter:
         completed,
         failed_ids,
         skipped_ids,
+        failed_reasons=None,
+        skipped_reasons=None,
     ):
         if current_id is None:
             current = "Waiting to start" if processed == 0 else "Finished"
@@ -435,8 +484,99 @@ class BotRouter:
             lines.append(f"Failed IDs: {cls._format_id_list(failed_ids)}")
         if title != "Copying" and skipped_ids:
             lines.append(f"Skipped IDs: {cls._format_id_list(skipped_ids)}")
+        if title != "Copying" and skipped_reasons:
+            lines.append("Skipped reasons:")
+            lines.extend(
+                f"- {count} {reason}" for reason, count in skipped_reasons.items()
+            )
+        if title != "Copying" and failed_reasons:
+            lines.append("Failed reasons:")
+            lines.extend(
+                f"- {count} {reason}" for reason, count in failed_reasons.items()
+            )
         lines.append(title)
         return "\n".join(lines)
+
+    @staticmethod
+    def _failure_reason(error):
+        message = str(error).lower()
+        if "larger than the configured limit" in message:
+            return "file exceeded the configured size limit"
+        if "no downloadable media" in message or "no text" in message:
+            return "post had no text or downloadable media"
+        if "download" in message:
+            return "media download failed"
+        if "deliver" in message or "send" in message or "upload" in message:
+            return "media upload failed"
+        return "Telegram or transfer error"
+
+    async def _preview_cleanup(self, event):
+        preview = await asyncio.to_thread(self.copier.cleanup_preview)
+        self._cleanup_confirmations[event.chat_id] = {
+            "expires_at": time.monotonic() + 60,
+            "paths": [item["path"] for item in preview["items"]],
+        }
+        if not preview["items"]:
+            await event.reply("Media cache is empty. Nothing will be deleted.")
+            return
+        await event.reply(
+            "Media cache cleanup preview\n\n"
+            f"Complete items: {preview['complete']}\n"
+            f"Incomplete items: {preview['incomplete']}\n"
+            f"Total size: {self._readable_bytes(preview['bytes'])}\n\n"
+            "Nothing has been deleted.\n"
+            "Reply with `/cleanup confirm` within 60 seconds to continue."
+        )
+
+    async def _confirm_cleanup(self, event):
+        confirmation = self._cleanup_confirmations.pop(event.chat_id, None)
+        if not confirmation or confirmation["expires_at"] < time.monotonic():
+            await event.reply(
+                "The cleanup preview has expired. Run `/cleanup` first; nothing was deleted."
+            )
+            return
+        result = await asyncio.to_thread(self.copier.cleanup, confirmation["paths"])
+        cleared_entities = self.copier.clear_entity_cache()
+        await event.reply(
+            "Media cache cleared.\n\n"
+            f"Removed: {result['removed']} item(s)\n"
+            f"Freed: {self._readable_bytes(result['bytes'])}\n"
+            f"Entity cache cleared: {cleared_entities} entries\n"
+            "Active transfers were left untouched."
+        )
+
+    async def _send_redacted_logs(self, event, log_path):
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".log", delete=False
+            ) as handle:
+                temporary_path = Path(handle.name)
+                raw = log_path.read_text(encoding="utf-8", errors="replace")
+                handle.write(self._redact_logs(raw))
+            await self.bot.send_file(
+                event.chat_id,
+                str(temporary_path),
+                caption="Bot logs (sensitive values redacted)",
+                reply_to=event.id,
+            )
+        except OSError:
+            await event.reply("The log file could not be read.")
+        finally:
+            if temporary_path:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _redact_logs(text):
+        secrets = [
+            os.getenv("TG_BOT_TOKEN", ""),
+            os.getenv("TG_USER_SESSION", ""),
+            os.getenv("TG_API_HASH", ""),
+        ]
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        return re.sub(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b", "[REDACTED_BOT_TOKEN]", text)
 
     @staticmethod
     def _format_id_list(message_ids):
@@ -453,8 +593,7 @@ class BotRouter:
             start = previous = value
         groups.append((start, previous))
         return ", ".join(
-            str(start) if start == end else f"{start}–{end}"
-            for start, end in groups
+            str(start) if start == end else f"{start}–{end}" for start, end in groups
         )
 
     @staticmethod
@@ -472,7 +611,12 @@ class BotRouter:
         minutes, seconds = divmod(remainder, 60)
         uptime = " ".join(
             f"{amount}{unit}"
-            for amount, unit in ((days, "d"), (hours, "h"), (minutes, "m"), (seconds, "s"))
+            for amount, unit in (
+                (days, "d"),
+                (hours, "h"),
+                (minutes, "m"),
+                (seconds, "s"),
+            )
             if amount or unit == "s"
         )
         disk = shutil.disk_usage(".")
@@ -480,11 +624,8 @@ class BotRouter:
         system_memory = psutil.virtual_memory().percent
         cpu = psutil.cpu_percent(interval=0.2)
         network = psutil.net_io_counters()
-        active = sum(
-            not job.done()
-            for jobs in self._jobs.values()
-            for job in jobs
-        )
+        cache = self.copier.cache_stats()
+        active = sum(not job.done() for jobs in self._jobs.values() for job in jobs)
         return (
             "Bot status\n"
             f"Uptime: {uptime}\n"
@@ -493,6 +634,7 @@ class BotRouter:
             f"System CPU: {cpu:.1f}% | RAM: {system_memory:.1f}%\n"
             f"Disk free: {self._readable_bytes(disk.free)} / "
             f"{self._readable_bytes(disk.total)}\n"
+            f"Media cache: {self._readable_bytes(cache['bytes'])} · {cache['items']} items\n"
             f"Network sent: {self._readable_bytes(network.bytes_sent)} | "
             f"received: {self._readable_bytes(network.bytes_recv)}"
         )
