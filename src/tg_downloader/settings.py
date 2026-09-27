@@ -21,6 +21,7 @@ class Settings:
     allowed_user_ids: frozenset[int]
     max_batch: int = 500
     max_file_bytes: int = 2 * 1024 * 1024 * 1024
+    media_dir: Path = Path("downloads")
 
     @classmethod
     def from_environment(cls, env_file: Path | None = None) -> Settings:
@@ -41,14 +42,23 @@ class Settings:
                 int(part.strip()) for part in raw_user_ids.split(",") if part.strip()
             )
         except ValueError as exc:
-            raise ConfigurationError("TG_ALLOWED_USER_IDS must be comma-separated integers") from exc
+            raise ConfigurationError(
+                "TG_ALLOWED_USER_IDS must be comma-separated integers"
+            ) from exc
         if not allowed_user_ids or any(user_id <= 0 for user_id in allowed_user_ids):
-            raise ConfigurationError("TG_ALLOWED_USER_IDS must contain positive Telegram user IDs")
+            raise ConfigurationError(
+                "TG_ALLOWED_USER_IDS must contain positive Telegram user IDs"
+            )
 
         max_batch = _optional_positive_int("TG_MAX_BATCH", 500)
         max_file_bytes = _optional_positive_int(
             "TG_MAX_FILE_BYTES", 2 * 1024 * 1024 * 1024
         )
+        media_dir = Path(
+            os.getenv("TG_MEDIA_DIR", "downloads").strip() or "downloads"
+        ).expanduser()
+        if media_dir.name in {"", ".", ".."}:
+            raise ConfigurationError("TG_MEDIA_DIR must name a directory")
         return cls(
             api_id=api_id,
             api_hash=api_hash,
@@ -57,6 +67,7 @@ class Settings:
             allowed_user_ids=allowed_user_ids,
             max_batch=max_batch,
             max_file_bytes=max_file_bytes,
+            media_dir=media_dir,
         )
 
 

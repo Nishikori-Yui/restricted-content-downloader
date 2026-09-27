@@ -39,12 +39,18 @@ async def run(settings: Settings):
             "Generate one with `python -m tg_downloader.session`."
         ) from exc
     reader = TelegramClient(
-        user_session, settings.api_id, settings.api_hash,
-        device_model="Post Copier", app_version="0.1.0",
+        user_session,
+        settings.api_id,
+        settings.api_hash,
+        device_model="Post Copier",
+        app_version="0.1.0",
     )
     sender = TelegramClient(
-        StringSession(), settings.api_id, settings.api_hash,
-        device_model="Post Copier Bot", app_version="0.1.0",
+        StringSession(),
+        settings.api_id,
+        settings.api_hash,
+        device_model="Post Copier Bot",
+        app_version="0.1.0",
     )
     try:
         await reader.connect()
@@ -54,14 +60,20 @@ async def run(settings: Settings):
             )
         owner_identity = await reader.get_me()
         if not owner_identity or owner_identity.bot:
-            raise RuntimeError("TG_USER_SESSION must belong to a Telegram user account.")
+            raise RuntimeError(
+                "TG_USER_SESSION must belong to a Telegram user account."
+            )
         await sender.start(bot_token=settings.bot_token)
         bot_identity = await sender.get_me()
         if not bot_identity or not bot_identity.bot:
             raise RuntimeError("TG_BOT_TOKEN did not start a bot account.")
 
         copier = PostCopier(
-            reader, sender, max_file_bytes=settings.max_file_bytes, concurrency=2
+            reader,
+            sender,
+            max_file_bytes=settings.max_file_bytes,
+            media_dir=settings.media_dir,
+            concurrency=2,
         )
         router = BotRouter(
             sender,

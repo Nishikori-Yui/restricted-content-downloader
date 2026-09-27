@@ -14,6 +14,7 @@ def _clear_settings(monkeypatch):
         "TG_ALLOWED_USER_IDS",
         "TG_MAX_BATCH",
         "TG_MAX_FILE_BYTES",
+        "TG_MEDIA_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -36,6 +37,21 @@ def test_settings_loads_limits_from_env_file(tmp_path: Path, monkeypatch):
     assert settings.allowed_user_ids == frozenset({10, 20})
     assert settings.max_batch == 12
     assert settings.max_file_bytes == 4096
+    assert settings.media_dir == Path("downloads")
+
+
+def test_settings_reads_media_dir(tmp_path: Path, monkeypatch):
+    _clear_settings(monkeypatch)
+    monkeypatch.setenv("TG_API_ID", "12345")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_BOT_TOKEN", "12345:token_value")
+    monkeypatch.setenv("TG_USER_SESSION", "session")
+    monkeypatch.setenv("TG_ALLOWED_USER_IDS", "10")
+    monkeypatch.setenv("TG_MEDIA_DIR", str(tmp_path / "media"))
+
+    settings = Settings.from_environment(tmp_path / "missing.env")
+
+    assert settings.media_dir == tmp_path / "media"
 
 
 def test_settings_rejects_invalid_bot_token(tmp_path: Path, monkeypatch):
